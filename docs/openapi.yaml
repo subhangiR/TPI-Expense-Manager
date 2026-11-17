@@ -1,0 +1,735 @@
+openapi: 3.0.3
+info:
+  title: Expense Management & Approval API
+  version: 1.0.0
+  description: |
+    REST API for submitting and approving employee expenses.
+
+    **How to try it in the browser**
+    1. Call `POST /auth/login` (use "Try it out") with a seeded account: `bob@tpi.com` / `User@123` (employee) or `alice@tpi.com` / `Admin@123` (admin).
+    2. Copy the `token` from the response.
+    3. Click the **Authorize** button at the top and paste the token.
+    4. Every other endpoint now works.
+
+    Errors always look like `{ "success": false, "message": "...", "errors": [ ... ] }`.
+servers:
+  - url: http://localhost:4000/api
+tags:
+  - name: Health
+  - name: Auth
+  - name: Users
+  - name: Expenses
+  - name: Workflow
+  - name: Real-time
+  - name: Lookups
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Is the server up?
+      security: []
+      responses:
+        '200':
+          description: Server is running
+  /health/db:
+    get:
+      tags: [Health]
+      summary: Is the database reachable?
+      security: []
+      responses:
+        '200':
+          description: Database is up
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with email and password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Logged in
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      token: { type: string }
+                      user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Wrong email or password
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Too many attempts from one address (10 per 15 minutes)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Account is inactive
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the logged-in user
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users:
+    get:
+      tags: [Users]
+      summary: List users (admin only)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: Matches name or email }
+        - { name: role, in: query, schema: { type: string, enum: [user, admin] } }
+        - { name: status, in: query, schema: { type: string, enum: [active, inactive] } }
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      users:
+                        type: array
+                        items: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /users/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Users]
+      summary: Get one user (admin, or the user themselves)
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Users]
+      summary: Update a user's name, role or status (admin only)
+      description: An admin cannot change their own role or status.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: Bob Brown }
+                role: { type: string, enum: [user, admin] }
+                status: { type: string, enum: [active, inactive] }
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /expenses:
+    get:
+      tags: [Expenses]
+      summary: List expenses
+      description: Normal users see only their own expenses. Admins see every submitted expense; drafts are private to their owner and never listed for admins.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 10 } }
+        - { name: search, in: query, schema: { type: string }, description: 'Matches title, description or employee name' }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/Status' } }
+        - { name: department, in: query, schema: { type: integer }, description: Department id }
+        - { name: category, in: query, schema: { type: integer }, description: Category id }
+        - { name: dateFrom, in: query, schema: { type: string, format: date }, description: Expense date on or after }
+        - { name: dateTo, in: query, schema: { type: string, format: date }, description: Expense date on or before }
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [id, title, employee_name, department, category, amount, status, expense_date, created_at]
+            default: created_at
+        - { name: sortOrder, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        '200':
+          description: A page of expenses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expenses:
+                        type: array
+                        items: { $ref: '#/components/schemas/Expense' }
+                      pagination: { $ref: '#/components/schemas/Pagination' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Expenses]
+      summary: Create an expense (saved as DRAFT)
+      description: |
+        Employees create expenses for themselves. Admins only review expenses, so they get 403.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateExpense' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expense: { $ref: '#/components/schemas/Expense' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /expenses/stats:
+    get:
+      tags: [Expenses]
+      summary: Dashboard numbers
+      description: |
+        Totals, counts per status, and spend per category, department and period.
+        Normal users get their own numbers; admins get everyone's submitted expenses (drafts excluded). Spend charts leave out
+        drafts, rejected and failed expenses. Without a date range the trend covers the last 12 months.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: dateFrom, in: query, schema: { type: string, format: date }, description: Expense date on or after }
+        - { name: dateTo, in: query, schema: { type: string, format: date }, description: Expense date on or before }
+      responses:
+        '200':
+          description: Dashboard numbers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Stats' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /expenses/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Expenses]
+      summary: Get one expense (owner, creator or admin)
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The expense
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expense: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Expenses]
+      summary: Edit an expense (DRAFT only)
+      description: Only the employee who owns the expense can edit it.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateExpense' }
+      responses:
+        '200':
+          description: Updated expense
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expense: { $ref: '#/components/schemas/Expense' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Expense is no longer a draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Expenses]
+      summary: Delete an expense (DRAFT only)
+      description: Only the employee who owns the expense can delete it.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Deleted
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Expense is no longer a draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /expenses/{id}/submit:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Workflow]
+      summary: Submit a draft expense
+      description: |
+        Moves DRAFT -> SUBMITTED -> PROCESSING, then automatically:
+        - amount **below** the threshold (default 5,000): PROCESSING -> APPROVED -> COMPLETED
+        - amount **at or above** the threshold: PROCESSING -> APPROVAL_REQUIRED (waits for an admin)
+        - processing error: PROCESSING -> FAILED
+
+        Only the employee who owns the expense can submit it. The response shows the final status.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The expense in its new status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expense: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Not a draft, or changed by someone else a moment ago
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /expenses/{id}/approve:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Workflow]
+      summary: Approve an expense (admin only)
+      description: APPROVAL_REQUIRED -> APPROVED -> COMPLETED.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment: { type: string, maxLength: 500, example: Approved for client work }
+      responses:
+        '200':
+          description: The expense, now COMPLETED
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expense: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Not awaiting approval
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /expenses/{id}/reject:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    post:
+      tags: [Workflow]
+      summary: Reject an expense (admin only, comment required)
+      description: APPROVAL_REQUIRED -> REJECTED. Rejected is final.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [comment]
+              properties:
+                comment: { type: string, maxLength: 500, example: Missing receipt }
+      responses:
+        '200':
+          description: The expense, now REJECTED
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      expense: { $ref: '#/components/schemas/Expense' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Not awaiting approval
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /expenses/{id}/history:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [Workflow]
+      summary: Workflow history (timeline), oldest first
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: History entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      history:
+                        type: array
+                        items: { $ref: '#/components/schemas/HistoryEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /events:
+    get:
+      tags: [Real-time]
+      summary: Live stream of expense status changes (Server-Sent Events)
+      description: |
+        Keep this connection open and you receive a message whenever an expense changes status.
+        Admins receive every change; users receive changes to their own expenses.
+
+        Browsers' `EventSource` cannot send headers, so the token may be passed as `?token=`.
+
+        Messages:
+        - `connected` - `{"userId": 1}`
+        - `expense-updated` - `{"expenseId": 13, "title": "...", "employeeId": 2, "createdBy": 2, "status": "COMPLETED"}`
+
+        (Swagger UI cannot display a live stream; use `curl -N "http://localhost:4000/api/events?token=<token>"`.)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: token, in: query, required: false, schema: { type: string }, description: 'JWT, as an alternative to the Authorization header' }
+      responses:
+        '200':
+          description: An open event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /departments:
+    get:
+      tags: [Lookups]
+      summary: List departments
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Departments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      departments:
+                        type: array
+                        items: { $ref: '#/components/schemas/LookupItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /categories:
+    get:
+      tags: [Lookups]
+      summary: List categories
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Categories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      categories:
+                        type: array
+                        items: { $ref: '#/components/schemas/LookupItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+
+  responses:
+    ValidationError:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: Validation failed
+            errors:
+              - { field: amount, message: Amount must be greater than zero }
+    Unauthorized:
+      description: Missing, invalid or expired token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Logged in, but not allowed to do this
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, example: alice@tpi.com }
+        password: { type: string, example: Admin@123 }
+    User:
+      type: object
+      properties:
+        id: { type: integer, example: 1 }
+        name: { type: string, example: Admin User }
+        email: { type: string, example: alice@tpi.com }
+        role: { type: string, enum: [user, admin] }
+        status: { type: string, enum: [active, inactive] }
+        department_id: { type: integer, nullable: true, description: The user's own department; pre-selected on new expenses }
+        department: { type: string, nullable: true, example: Sales }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    LookupItem:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+    Stats:
+      type: object
+      properties:
+        total_count: { type: integer }
+        total_amount: { type: number }
+        by_status:
+          type: array
+          items:
+            type: object
+            properties:
+              status: { $ref: '#/components/schemas/Status' }
+              count: { type: integer }
+              amount: { type: number }
+        by_category: { type: array, items: { $ref: '#/components/schemas/SpendByName' } }
+        by_department: { type: array, items: { $ref: '#/components/schemas/SpendByName' } }
+        period_unit: { type: string, enum: [day, month], description: What each by_period entry stands for }
+        by_period:
+          type: array
+          items:
+            type: object
+            properties:
+              period: { type: string, example: 2026-11, description: 'YYYY-MM-DD or YYYY-MM' }
+              amount: { type: number }
+              count: { type: integer }
+    SpendByName:
+      type: object
+      properties:
+        name: { type: string }
+        amount: { type: number }
+        count: { type: integer }
+    Status:
+      type: string
+      enum: [DRAFT, SUBMITTED, PROCESSING, APPROVAL_REQUIRED, APPROVED, COMPLETED, REJECTED, FAILED]
+    Expense:
+      type: object
+      properties:
+        id: { type: integer, example: 1 }
+        display_id: { type: string, example: '001', description: The id padded to 3 digits, shown to people instead of the plain number }
+        title: { type: string, example: Client Meeting Travel }
+        employee_id: { type: integer }
+        employee_name: { type: string }
+        department_id: { type: integer }
+        department: { type: string, example: Sales }
+        category_id: { type: integer }
+        category: { type: string, example: Travel }
+        amount: { type: number, example: 12500 }
+        expense_date: { type: string, format: date, example: '2026-11-10' }
+        description: { type: string, nullable: true }
+        priority: { type: string, enum: [low, medium, high] }
+        status: { $ref: '#/components/schemas/Status' }
+        created_by: { type: integer }
+        created_by_name: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateExpense:
+      type: object
+      required: [title, department_id, category_id, amount, expense_date]
+      properties:
+        title: { type: string, maxLength: 150, example: Client Meeting Travel }
+        department_id: { type: integer, example: 1 }
+        category_id: { type: integer, example: 1 }
+        amount: { type: number, minimum: 0.01, example: 12500 }
+        expense_date: { type: string, format: date, example: '2026-11-10' }
+        description: { type: string, maxLength: 1000, example: Travel expenses for client meeting }
+        priority: { type: string, enum: [low, medium, high], default: medium }
+    UpdateExpense:
+      type: object
+      description: Send any of these fields (at least one).
+      properties:
+        title: { type: string, maxLength: 150 }
+        department_id: { type: integer }
+        category_id: { type: integer }
+        amount: { type: number, minimum: 0.01 }
+        expense_date: { type: string, format: date }
+        description: { type: string, maxLength: 1000 }
+        priority: { type: string, enum: [low, medium, high] }
+    HistoryEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        expense_id: { type: integer }
+        from_status: { type: string, nullable: true, description: Null for the first entry }
+        to_status: { $ref: '#/components/schemas/Status' }
+        action: { type: string, example: APPROVE }
+        comments: { type: string, nullable: true }
+        performed_by: { type: integer }
+        performed_by_name: { type: string }
+        created_at: { type: string, format: date-time }
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
